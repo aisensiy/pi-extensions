@@ -40,18 +40,21 @@ export default function piPr(pi: ExtensionAPI): void {
       return;
     }
     polling = true;
-    controller = new AbortController();
+    const requestController = new AbortController();
+    controller = requestController;
     try {
-      const pr = await fetchPullRequest(pi, controller.signal);
-      if (!controller.signal.aborted) {
+      const pr = await fetchPullRequest(pi, requestController.signal);
+      if (!requestController.signal.aborted) {
         ctx.ui.setStatus(
           STATUS_KEY,
           pr ? renderStatus(pr, ctx.ui.theme, detectBackground()) : undefined,
         );
       }
     } finally {
-      controller = null;
-      polling = false;
+      if (controller === requestController) {
+        controller = null;
+        polling = false;
+      }
     }
   };
 
