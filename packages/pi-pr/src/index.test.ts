@@ -1,6 +1,66 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import piPr from "./index.js";
+
+const openPrJson = JSON.stringify({ number: 7, url: "https://example.com/pr/7" });
+
+describe("piPr refresh lifecycle", () => {
+  it("cancels a pending request on shutdown and ignores its result", async () => {
+    const host = createHarness();
+    const session = host.createSession();
+    const command = session.openPr();
+    const request = await host.nextRequest();
+
+    session.shutdown();
+    expect(request.signal?.aborted).toBe(true);
+
+    // A cancelled process can still return output before it exits.
+    request.respond(openPrJson);
+    await expect(command).resolves.toBeUndefined();
+    expect(session.footer()).toBeUndefined();
+  });
+
+  it("keeps a newer request cancellable after an old cancelled request completes", async () => {
+    const host = createHarness();
+    const first = host.createSession();
+    const oldCommand = first.openPr();
+    const oldRequest = await host.nextRequest();
+    first.shutdown();
+
+    const second = host.createSession();
+    const newCommand = second.openPr();
+    const newRequest = await host.nextRequest();
+
+    oldRequest.respond(openPrJson);
+    await expect(oldCommand).resolves.toBeUndefined();
+
+    // The newer request must remain active until its own session shuts down.
+    expect(newRequest.signal?.aborted).toBe(false);
+    second.shutdown();
+    expect(newRequest.signal?.aborted).toBe(true);
+
+    newRequest.respond(openPrJson);
+    await expect(newCommand).resolves.toBeUndefined();
+    expect(first.footer()).toBeUndefined();
+    expect(second.footer()).toBeUndefined();
+  });
+
+  it("shows the current PR in the footer when a session starts", async () => {
+    const host = createHarness();
+    const session = host.createSession();
+
+    session.start();
+    const request = await host.nextRequest();
+    request.respond(openPrJson);
+
+    await vi.waitFor(() => expect(session.footer()).toContain("#7"));
+  });
+});
+
+interface PendingRequest {
+  signal: AbortSignal | undefined;
+  respond: (stdout: string) => void;
+}
 
 interface ExecResult {
   stdout: string;
@@ -9,57 +69,15 @@ interface ExecResult {
   killed: boolean;
 }
 
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (reason: unknown) => void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve: (value: T) => void = () => {};
-  let reject: (reason: unknown) => void = () => {};
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
-const openPrJson = JSON.stringify({ number: 7, url: "https://example.com/pr/7" });
-
-function ghResult(stdout: string): ExecResult {
-  return { stdout, stderr: "", code: 0, killed: false };
-}
-
-const flush = () => new Promise((resolve) => setTimeout(resolve, 10));
-
-/**
- * Drives the real extension callbacks (registered `/pr` command, `session_start`,
- * `session_shutdown`) while faking only the external `gh` exec: `pr view --web`
- * resolves immediately, each `pr view --json` stays pending until the test
- * resolves it through `jsonQueries`. The abort signal handed to each `gh` call
- * is recorded so tests can assert which in-flight refresh is still cancellable.
- */
+/** Run the real extension through its host API. Fake only process execution and UI. */
 function createHarness() {
   const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
   const commands = new Map<
     string,
     { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
   >();
-  const jsonQueries: Deferred<ExecResult>[] = [];
-  const execCalls: { args: string[]; opts: { signal?: AbortSignal } }[] = [];
-
+  const requests: PendingRequest[] = [];
   const flags = new Map<string, string>();
-  const exec = vi.fn((cmd: string, args: string[], opts: { signal?: AbortSignal }) => {
-    void cmd;
-    if (args.includes("--web")) {
-      return Promise.resolve(ghResult(""));
-    }
-    execCalls.push({ args, opts });
-    const query = deferred<ExecResult>();
-    jsonQueries.push(query);
-    return query.promise;
-  });
 
   const pi = {
     registerFlag: (name: string, opts: { default?: string }) => {
@@ -77,94 +95,51 @@ function createHarness() {
     ) => {
       commands.set(name, def);
     },
-    exec,
+    exec: (_cmd: string, args: string[], opts: { signal?: AbortSignal }) => {
+      if (args.includes("--web")) {
+        return Promise.resolve(ghResult(""));
+      }
+      return new Promise<ExecResult>((resolve) => {
+        requests.push({
+          signal: opts.signal,
+          respond: (stdout) => resolve(ghResult(stdout)),
+        });
+      });
+    },
   } as unknown as ExtensionAPI;
 
   piPr(pi);
 
-  const makeCtx = () => {
-    const setStatus = vi.fn();
-    const ctx = {
-      ui: {
-        setStatus,
-        theme: { fg: (_color: string, text: string) => text },
-      },
-    } as unknown as ExtensionContext;
-    return { ctx, setStatus };
-  };
+  return {
+    createSession: () => {
+      const statuses = new Map<string, string | undefined>();
+      const ctx = {
+        ui: {
+          setStatus: (key: string, text: string | undefined) => statuses.set(key, text),
+          theme: { fg: (_color: string, text: string) => text },
+        },
+      } as unknown as ExtensionContext;
+      const shutdown = () => handlers.get("session_shutdown")!({}, ctx);
+      onTestFinished(shutdown);
 
-  return { handlers, commands, jsonQueries, execCalls, makeCtx };
+      return {
+        start: () => handlers.get("session_start")!({}, ctx),
+        shutdown,
+        openPr: () => commands.get("pr")!.handler("", ctx),
+        footer: () => statuses.get("pi-pr"),
+      };
+    },
+    nextRequest: () =>
+      vi.waitFor(() => {
+        const request = requests.shift();
+        if (!request) {
+          throw new Error("No pending gh request");
+        }
+        return request;
+      }),
+  };
 }
 
-describe("piPr refresh lifecycle", () => {
-  it("cancels a pending refresh on shutdown and never touches the stale ctx", async () => {
-    const h = createHarness();
-    const { ctx, setStatus } = h.makeCtx();
-    const command = h.commands.get("pr");
-    if (!command) {
-      throw new Error("pr command was not registered");
-    }
-
-    const outcome = command.handler("", ctx).then(
-      () => "resolved" as const,
-      (error: unknown) => error,
-    );
-    await vi.waitFor(() => expect(h.jsonQueries.length).toBe(1));
-
-    h.handlers.get("session_shutdown")?.({}, ctx);
-    expect(h.execCalls[0].opts.signal?.aborted).toBe(true);
-
-    h.jsonQueries[0].resolve(ghResult(openPrJson));
-    await flush();
-
-    expect(await outcome).toBe("resolved");
-    expect(setStatus).not.toHaveBeenCalled();
-  });
-
-  it("does not let an old cancelled refresh clobber a newer pending one", async () => {
-    const h = createHarness();
-    const first = h.makeCtx();
-    const command = h.commands.get("pr");
-    if (!command) {
-      throw new Error("pr command was not registered");
-    }
-
-    const oldOutcome = command.handler("", first.ctx).then(
-      () => "resolved" as const,
-      (error: unknown) => error,
-    );
-    await vi.waitFor(() => expect(h.jsonQueries.length).toBe(1));
-
-    h.handlers.get("session_shutdown")?.({}, first.ctx);
-
-    const second = h.makeCtx();
-    h.handlers.get("session_start")?.({}, second.ctx);
-    await vi.waitFor(() => expect(h.jsonQueries.length).toBe(2));
-
-    h.jsonQueries[0].resolve(ghResult(openPrJson));
-    await flush();
-
-    h.handlers.get("session_shutdown")?.({}, second.ctx);
-    h.jsonQueries[1].resolve(ghResult(openPrJson));
-    await flush();
-
-    expect(await oldOutcome).toBe("resolved");
-    expect(first.setStatus).not.toHaveBeenCalled();
-    expect(second.setStatus).not.toHaveBeenCalled();
-    expect(h.execCalls[1].opts.signal?.aborted).toBe(true);
-  });
-
-  it("renders the PR status into the footer on a normal refresh", async () => {
-    const h = createHarness();
-    const { ctx, setStatus } = h.makeCtx();
-
-    h.handlers.get("session_start")?.({}, ctx);
-    await vi.waitFor(() => expect(h.jsonQueries.length).toBe(1));
-
-    h.jsonQueries[0].resolve(ghResult(openPrJson));
-    await vi.waitFor(() => expect(setStatus).toHaveBeenCalledTimes(1));
-    expect(setStatus).toHaveBeenCalledWith("pi-pr", expect.stringContaining("#7"));
-
-    h.handlers.get("session_shutdown")?.({}, ctx);
-  });
-});
+function ghResult(stdout: string): ExecResult {
+  return { stdout, stderr: "", code: 0, killed: false };
+}
